@@ -1,131 +1,81 @@
-import os
-import re
-import logging
-import tempfile
-
-from telegram import Update, Message, InputFile
-from telegram.ext import ContextTypes
-from telegram.constants import ChatAction
-
+import whisper
 import pytesseract
 from PIL import Image
-import aiohttp
+import io
+from telegram import Update
+from telegram.ext import ContextTypes
 
-import whisper
-import moviepy.editor as mp
-import speech_recognition as sr
+# Load Whisper model for audio processing
+whisper_model = whisper.load_model("base")  # You can choose a different model size like "small", "medium", or "large"
 
-# Initialize Whisper model
-whisper_model = whisper.load_model("base")
+# Function to transcribe audio (voice messages, audio files)
+async def download_and_transcribe_audio(file):
+    # Download the audio file as a bytearray
+    audio = await file.download_as_bytearray()
+    
+    # Process the audio using Whisper
+    result = whisper_model.transcribe(io.BytesIO(audio))
+    
+    # Return transcribed text
+    return result['text']
 
-# Homework keywords
-HOMEWORK_KEYWORDS = [
-    "homework", "question", "worksheet", "exercise", "page",
-    "complete", "write", "read", "submit", "draw", "copy", "do"
-]
+# Function to extract text from images using OCR (Tesseract)
+def extract_text_from_image(image_bytes):
+    # Open image using Pillow
+    image = Image.open(io.BytesIO(image_bytes))
+    
+    # Use pytesseract to extract text from the image
+    text = pytesseract.image_to_string(image)
+    
+    # Return extracted text
+    return text
 
-# Junk patterns
-JUNK_PATTERNS = [
-    r"(?i)/\w+bot@", r"(http|www\.)", r"free proxy", r"vpn", r"promo", r"subscribe"
-]
+# Function to check if the extracted text contains homework-related keywords
+def is_homework_text(text):
+    # Define keywords associated with homework
+    homework_keywords = [
+        "write", "read", "draw", "page", "complete", "question", 
+        "homework", "exercise", "submit", "copy", "worksheet"
+    ]
+    
+    # Scan through the text and check for the presence of any homework-related keywords
+    for keyword in homework_keywords:
+        if keyword in text.lower():
+            return True
+    return False
 
-# Check if message is junk
-def is_junk_message(text: str) -> bool:
-    return any(re.search(pattern, text) for pattern in JUNK_PATTERNS)
-
-# Check if message is homework
-def is_homework(text: str) -> bool:
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in HOMEWORK_KEYWORDS)
-
-# Get forwarded parent group ID
-def get_parent_group_id(student_chat_id: int, bot_data) -> int | None:
-    routes = bot_data.get("ROUTES")
-    if not routes:
-        return None
-    try:
-        route_map = {int(k): int(v) for k, v in [pair.split(":") for pair in routes.split(",")]}
-        return route_map.get(student_chat_id)
-    except Exception as e:
-        logging.error(f"Error parsing ROUTES: {e}")
-        return None
-
-# OCR text from Telegram image
-async def extract_text_from_image(message: Message) -> str:
-    if not message.photo:
-        return ""
-    try:
-        photo_file = await message.photo[-1].get_file()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as img_file:
-            await photo_file.download_to_drive(img_file.name)
-            image = Image.open(img_file.name)
-            text = pytesseract.image_to_string(image)
-            return text.strip()
-    except Exception as e:
-        logging.warning(f"OCR failed: {e}")
-        return ""
-
-# Convert voice/audio/video to text using Whisper
-async def extract_text_from_audio(update: Update, message: Message, context: ContextTypes.DEFAULT_TYPE) -> str:
-    audio_file = None
-    ext = "ogg"
-
-    try:
-        file = await message.voice.get_file() if message.voice else \
-               await message.audio.get_file() if message.audio else \
-               await message.video.get_file()
-
-        if message.audio:
-            ext = message.audio.file_name.split('.')[-1]
-        elif message.video:
-            ext = "mp4"
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as temp:
-            await file.download_to_drive(temp.name)
-            audio_file = temp.name
-
-        # Convert to WAV if needed (for fallback)
-        audio_path = audio_file
-        if ext in ("mp4", "mov"):
-            video = mp.VideoFileClip(audio_path)
-            wav_path = audio_path.replace(f".{ext}", ".wav")
-            video.audio.write_audiofile(wav_path, codec='pcm_s16le')
-            audio_path = wav_path
-
-        # Use Whisper
-        result = whisper_model.transcribe(audio_path)
-        return result.get("text", "").strip()
-
-    except Exception as e:
-        logging.warning(f"Whisper transcription failed: {e}")
-
-        # Try fallback using Google SpeechRecognition
-        try:
-            r = sr.Recognizer()
-            with sr.AudioFile(audio_path) as source:
-                audio_data = r.record(source)
-                text = r.recognize_google(audio_data)
-                return text
-        except Exception as e2:
-            logging.error(f"Google STT fallback failed: {e2}")
-            return ""
-
-# Forward to parent group
-async def forward_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Function to handle image processing and homework forwarding
+async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    student_chat_id = message.chat_id
-    parent_chat_id = get_parent_group_id(student_chat_id, context.bot_data)
+    
+    # If the message contains an image (photo)
+    if message.photo:
+        await message.chat.send_action("upload_photo")
+        file = await message.photo[-1].get_file()  # Get the largest resolution photo
+        image_bytes = await file.download_as_bytearray()
+        
+        # Extract text from image using OCR
+        extracted_text = extract_text_from_image(image_bytes)
+        
+        if is_homework_text(extracted_text):
+            # Forward the message to the parent group (example)
+            await forward_homework_message(update, extracted_text)
 
-    if not parent_chat_id:
-        logging.info(f"No route found for {student_chat_id}")
-        return
+    # If the message contains audio or voice (voice message or audio file)
+    elif message.voice or message.audio:
+        await message.chat.send_action("record_audio")
+        file = await (message.voice or message.audio).get_file()
+        
+        # Transcribe the audio using Whisper
+        transcribed_text = await download_and_transcribe_audio(file)
+        
+        if is_homework_text(transcribed_text):
+            # Forward the transcribed homework message to the parent group (example)
+            await forward_homework_message(update, transcribed_text)
 
-    try:
-        await message.copy(chat_id=parent_chat_id)
-        logging.info(f"Forwarded message from {student_chat_id} to {parent_chat_id}")
-    except Exception as e:
-        logging.warning(f"Failed to forward: {e}")
-
-# Admin check
-def is_admin(user_id: int, bot_data) -> bool:
-    return user_id in bot_data.get("ADMIN_CHAT_IDS", set())
+# Example function for forwarding the message to a parent group
+async def forward_homework_message(update: Update, homework_text: str):
+    # Forward the message to the parent group (you can replace with actual group ID)
+    parent_group_chat_id = "YOUR_PARENT_GROUP_CHAT_ID"  # Replace with your parent group chat ID
+    await update.message.reply_text(f"Homework received: {homework_text}")
+    await context.bot.send_message(chat_id=parent_group_chat_id, text=f"Homework Alert: {homework_text}")
