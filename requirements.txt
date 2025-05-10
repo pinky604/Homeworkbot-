@@ -1,0 +1,6 @@
+python-telegram-bot
+aiohttp
+python-dotenv
+openai-whisper
+pytesseract
+Pillow
